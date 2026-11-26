@@ -20,6 +20,16 @@ class Store:
         self._service_registry: dict[str, Any] = {}
         self._metrics: dict[str, list[dict[str, Any]]] = {}
         self._event_queue: list[dict[str, Any]] = []
+        # 样本版本台账：Schema匹配送检的每个样本都是不可变版本，
+        # 质量抽检、数据导出只引用具体 sample_id，杜绝拿旧结论放行新样本。
+        self._sample_versions: dict[str, dict[str, Any]] = {}
+        self._sample_seq = 0
+        # 字段确认记录：(sample_id, field) 维度，确认只对实际核过的值有效。
+        self._field_confirmations: dict[tuple[str, str], dict[str, Any]] = {}
+        # 受理幂等：request_id -> 首次受理结论，重送直接返回同一次结论。
+        self._idempotent_responses: dict[str, dict[str, Any]] = {}
+        # 导出采纳记录：export_id -> 放行时采用的样本与字段值快照。
+        self._export_adoptions: dict[int, dict[str, Any]] = {}
 
     # ── 基础存取 ──────────────────────────────
 
@@ -118,6 +128,157 @@ class Store:
             if tm not in edges[fm]:
                 edges[fm].append(tm)
         return edges
+
+    # ── 样本版本台账（Schema匹配 → 质量抽检 → 数据导出 共享链路） ──
+
+    def register_sample_version(
+        self,
+        *,
+        batch: str,
+        schema_id: int,
+        config_version: int,
+        fields: dict[str, Any],
+        sources: dict[str, Any],
+        raw_sample: dict[str, Any],
+        note: str = "",
+    ) -> dict[str, Any]:
+        """登记一个不可变的送检样本版本。
+
+        同批次再次送检会生成新版本号，并把旧版本标记为 superseded，
+        旧版本及其确认记录仍然保留，供运营回看仍在复核的字段。
+        """
+        self._sample_seq += 1
+        sample_id = f"SMP-{batch}-{self._sample_seq:04d}"
+        prior = self.latest_sample_version(batch)
+        version_no = (prior["version"] + 1) if prior else 1
+        sample = {
+            "sample_id": sample_id,
+            "batch": batch,
+            "version": version_no,
+            "schema_id": schema_id,
+            "config_version": config_version,
+            # fields/sources 做拷贝固化，后续配置更正不会回改已送检的样本
+            "fields": dict(fields),
+            "sources": dict(sources),
+            "raw_sample": dict(raw_sample),
+            "note": note,
+            "status": "送检中",
+            "claimed_by": None,
+            "claimed_quality_id": None,
+            "claimed_at": None,
+            "superseded_by": None,
+            "created_ts": time.time(),
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        self._sample_versions[sample_id] = sample
+        if prior is not None and prior.get("superseded_by") is None:
+            prior["superseded_by"] = sample_id
+            if prior["status"] in ("送检中", "已领取", "复核中"):
+                prior["status"] = "已被替代"
+        return sample
+
+    def find_sample_version(self, sample_id: str) -> dict[str, Any] | None:
+        return self._sample_versions.get(sample_id)
+
+    def sample_versions(self, batch: str | None = None) -> list[dict[str, Any]]:
+        rows = list(self._sample_versions.values())
+        if batch is not None:
+            rows = [row for row in rows if row["batch"] == batch]
+        return sorted(rows, key=lambda row: (row["batch"], row["version"]))
+
+    def latest_sample_version(self, batch: str) -> dict[str, Any] | None:
+        rows = self.sample_versions(batch)
+        return rows[-1] if rows else None
+
+    def claim_sample_version(
+        self, sample_id: str, operator: str, quality_check_id: int
+    ) -> tuple[dict[str, Any] | None, str]:
+        """把样本领给某个抽检任务/运营；同一时刻一份样本只能在一个单子上。"""
+        sample = self.find_sample_version(sample_id)
+        if sample is None:
+            return None, "样本不存在或已归档"
+        holder = sample.get("claimed_quality_id")
+        if holder is not None and holder != quality_check_id:
+            return sample, f"样本已被抽检任务 {holder} 领走"
+        sample["claimed_by"] = operator
+        sample["claimed_quality_id"] = quality_check_id
+        sample["claimed_at"] = time.time()
+        if sample["status"] in ("送检中",):
+            sample["status"] = "已领取"
+        return sample, "领取成功"
+
+    def confirm_field(
+        self,
+        sample_id: str,
+        field: str,
+        *,
+        operator: str,
+        expected_value: Any = None,
+        passed: bool = True,
+        remark: str = "",
+    ) -> tuple[dict[str, Any] | None, str, bool]:
+        """确认样本上的某个字段。
+
+        返回 (记录, 消息, 是否本次新建)。确认只对登记时的字段值生效：
+        传入 expected_value 且与样本固化值不一致时拒绝，旧确认不能挪用到新样本。
+        """
+        sample = self.find_sample_version(sample_id)
+        if sample is None:
+            return None, "样本不存在或已归档", False
+        if field not in sample["fields"]:
+            return None, f"样本 {sample_id} 不含字段 {field}", False
+        actual_value = sample["fields"][field]
+        if expected_value is not None and str(expected_value) != str(actual_value):
+            return None, (
+                f"字段值已变更：确认针对 {expected_value!r}，"
+                f"该样本当前固化值为 {actual_value!r}，请按最新送检版重新核对"
+            ), False
+        key = (sample_id, field)
+        existing = self._field_confirmations.get(key)
+        if existing is not None:
+            return existing, "该字段已确认，返回首次受理结论", False
+        record = {
+            "sample_id": sample_id,
+            "batch": sample["batch"],
+            "field": field,
+            "value": actual_value,
+            "source": sample["sources"].get(field),
+            "passed": bool(passed),
+            "operator": operator,
+            "remark": remark,
+            "request_id": None,
+            "confirmed_ts": time.time(),
+            "confirmed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        self._field_confirmations[key] = record
+        if sample["status"] in ("已领取", "送检中"):
+            sample["status"] = "复核中"
+        return record, "字段确认已受理", True
+
+    def field_confirmations(self, sample_id: str) -> list[dict[str, Any]]:
+        return [
+            dict(rec)
+            for rec in self._field_confirmations.values()
+            if rec["sample_id"] == sample_id
+        ]
+
+    def remember_idempotent(self, request_id: str, conclusion: dict[str, Any]) -> dict[str, Any]:
+        """登记幂等受理结论；同一 request_id 重送时原样返回。"""
+        if request_id not in self._idempotent_responses:
+            stored = dict(conclusion)
+            stored["request_id"] = request_id
+            stored["accepted_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            self._idempotent_responses[request_id] = stored
+        return self._idempotent_responses[request_id]
+
+    def idempotent_response(self, request_id: str) -> dict[str, Any] | None:
+        return self._idempotent_responses.get(request_id)
+
+    def record_export_adoption(self, export_id: int, adoption: dict[str, Any]) -> None:
+        self._export_adoptions[export_id] = dict(adoption)
+
+    def export_adoption(self, export_id: int) -> dict[str, Any] | None:
+        return self._export_adoptions.get(export_id)
 
     # ── 看板概览 ──────────────────────────────
 

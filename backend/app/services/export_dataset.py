@@ -2,10 +2,17 @@
 
 跨模块数据流：
 - export_dataset ← quality_check: 质量抽检通过后触发导出
+
+链路修复要点：
+- 导出申请按抽检单校验当前最新送检样本：只有该样本全部字段实际确认、
+  抽检单处于通过状态才放行；旧样本留下的通过状态不能放行新样本，
+  未满足条件时返回「还需补做抽检」，不会生成凭旧状态放行的导出任务。
+- 每个导出任务固化放行样本及其实际采用的字段值/来源，已生成的导出
+  随时可通过 adoption 追溯回当时采用的值。
+- 同一抽检单同一负责人的申请幂等，避免重复申请在导出列表里多出任务。
 """
 from __future__ import annotations
 
-import json
 import random
 import time
 from typing import Any
@@ -34,10 +41,116 @@ class ExportDatasetService(BaseModuleService):
         entry["_exported_rows"] = 0
         entry["_export_errors"] = []
         entry["_start_ts"] = 0
+        entry["_quality_check_id"] = values.get("_quality_check_id")
+        entry["_applicant"] = values.get("_applicant")
+        entry["_adopted_sample_id"] = None
         store.record_metric("export_dataset", "export_task_created", 1,
                             {"format": values.get("导出格式", ""),
                              "source": values.get("数据来源", "")})
         return entry, []
+
+    # ── 抽检联动申请（修复链路入口） ───────────────────────────
+
+    def apply_for_export(
+        self,
+        quality_check_id: int,
+        *,
+        applicant: str = "导出负责人",
+        export_format: str = "CSV",
+    ) -> dict[str, Any]:
+        """导出负责人按抽检单申请导出。
+
+        返回 ok/消息与任务（若已创建）。负责人能直接看到自己拿到的是哪份
+        通过抽检的样本，或为什么还需要补做抽检。
+        """
+        quality = store.find("quality_check", quality_check_id)
+        if quality is None:
+            return {"ok": False, "message": f"抽检任务 {quality_check_id} 不存在", "entry": None}
+        batch = quality.get("数据批次", "")
+        latest = store.latest_sample_version(batch)
+
+        # 幂等：同一抽检单+负责人已申请过，直接回给同一笔任务
+        for row in store.rows(self.MODULE):
+            if row.get("_quality_check_id") == quality_check_id and row.get("_applicant") == applicant:
+                return {
+                    "ok": row.get("status") == "已完成",
+                    "message": "该申请已受理，返回已登记的导出任务",
+                    "entry": row,
+                    "sample_id": row.get("_adopted_sample_id"),
+                    "idempotent": True,
+                }
+
+        if latest is None:
+            return {"ok": False, "message": f"批次 {batch} 还没有送检样本，需补做抽检",
+                    "entry": None, "sample_id": None}
+        confirmations = store.field_confirmations(latest["sample_id"])
+        all_confirmed = len(confirmations) >= len(latest["fields"]) and len(latest["fields"]) > 0
+        if quality.get("status") != "通过" or not all_confirmed:
+            held_id = quality.get("_current_sample_id")
+            return {
+                "ok": False,
+                "entry": None,
+                "sample_id": latest["sample_id"],
+                "held_sample_id": held_id,
+                "message": (
+                    f"最新送检样本 {latest['sample_id']}（配置v{latest['config_version']}）"
+                    "尚未完成抽检放行，请先领取并确认全部字段后再申请导出"
+                ),
+                "need_rerun_check": True,
+            }
+
+        entry, _ = self.create_entry({
+            "任务编号": f"EXPO-Q{quality_check_id}-{latest['version']}",
+            "数据来源": f"{batch}/{latest['sample_id']}",
+            "导出格式": export_format,
+            "字段筛选": ",".join(latest["fields"].keys()),
+            "_quality_check_id": quality_check_id,
+            "_applicant": applicant,
+        })
+        entry["_adopted_sample_id"] = latest["sample_id"]
+        self.execute_export(entry["id"])
+        # 固化实际采用的字段值，已生成的导出可永久查回
+        store.record_export_adoption(entry["id"], {
+            "export_id": entry["id"],
+            "quality_check_id": quality_check_id,
+            "batch": batch,
+            "sample_id": latest["sample_id"],
+            "sample_version": latest["version"],
+            "config_version": latest["config_version"],
+            "applicant": applicant,
+            "fields": dict(latest["fields"]),
+            "sources": dict(latest["sources"]),
+            "confirmations": store.field_confirmations(latest["sample_id"]),
+            "adopted_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        store.pipeline_trace(
+            "quality_check", "export_dataset", quality_check_id, entry["id"],
+            "quality_passed",
+            {"sample_id": latest["sample_id"], "batch": batch, "applicant": applicant},
+        )
+        return {
+            "ok": True,
+            "message": f"已按通过抽检的样本 {latest['sample_id']} 放行导出",
+            "entry": entry,
+            "sample_id": latest["sample_id"],
+            "adoption": store.export_adoption(entry["id"]),
+        }
+
+    def get_export_trace(self, entry_id: int) -> dict[str, Any] | None:
+        """查回导出任务实际采用的样本与字段值。"""
+        entry = store.find(self.MODULE, entry_id)
+        if entry is None:
+            return None
+        adoption = store.export_adoption(entry_id)
+        return {
+            "export_id": entry_id,
+            "任务编号": entry.get("任务编号"),
+            "status": entry.get("status"),
+            "adopted_sample_id": entry.get("_adopted_sample_id"),
+            "quality_check_id": entry.get("_quality_check_id"),
+            "applicant": entry.get("_applicant"),
+            "adoption": adoption,
+        }
 
     def execute_export(self, entry_id: int, data: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
         """执行数据导出。"""
@@ -71,7 +184,11 @@ class ExportDatasetService(BaseModuleService):
 
     def export_with_quality_check(self, entry_id: int, quality_check_id: int,
                                   passed: bool) -> dict[str, Any] | None:
-        """质量抽检通过后触发导出。跨模块：quality_check → export_dataset"""
+        """质量抽检通过后触发导出。跨模块：quality_check → export_dataset
+
+        链路修复后：passed=True 还必须能找到已完整确认的最新样本，
+        否则拒绝放行（旧的通过状态不足以导出新样本）。
+        """
         entry = store.find(self.MODULE, entry_id)
         if entry is None:
             return None
@@ -79,9 +196,40 @@ class ExportDatasetService(BaseModuleService):
             entry["status"] = "已失败"
             entry["abnormal"] = True
             return entry
+        quality = store.find("quality_check", quality_check_id)
+        batch = quality.get("数据批次", "") if quality else ""
+        latest = store.latest_sample_version(batch) if batch else None
+        if latest is None:
+            entry["status"] = "已失败"
+            entry["abnormal"] = True
+            entry["_export_errors"].append("没有可追溯的送检样本，拒绝凭旧状态放行")
+            return entry
+        confirmations = store.field_confirmations(latest["sample_id"])
+        if len(confirmations) < len(latest["fields"]) or not latest["fields"]:
+            entry["status"] = "已失败"
+            entry["abnormal"] = True
+            entry["_export_errors"].append(
+                f"样本 {latest['sample_id']} 尚未完成全部字段确认，需补做抽检")
+            return entry
+        entry["_quality_check_id"] = quality_check_id
+        entry["_adopted_sample_id"] = latest["sample_id"]
+        entry["数据来源"] = f"{batch}/{latest['sample_id']}"
+        store.record_export_adoption(entry["id"], {
+            "export_id": entry["id"],
+            "quality_check_id": quality_check_id,
+            "batch": batch,
+            "sample_id": latest["sample_id"],
+            "sample_version": latest["version"],
+            "config_version": latest["config_version"],
+            "fields": dict(latest["fields"]),
+            "sources": dict(latest["sources"]),
+            "confirmations": confirmations,
+            "adopted_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
         store.pipeline_trace(
             "quality_check", "export_dataset", quality_check_id, entry_id,
-            "quality_passed", {"action": "trigger_export"}
+            "quality_passed", {"action": "trigger_export",
+                                "sample_id": latest["sample_id"]}
         )
         return self.execute_export(entry_id)
 
@@ -104,4 +252,5 @@ class ExportDatasetService(BaseModuleService):
         tasks = store.rows(self.MODULE)
         base["completed_exports"] = sum(1 for t in tasks if t.get("status") == "已完成")
         base["total_rows_exported"] = sum(t.get("_exported_rows", 0) for t in tasks)
+        base["traceable_exports"] = sum(1 for t in tasks if t.get("_adopted_sample_id"))
         return base
